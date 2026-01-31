@@ -17,16 +17,11 @@ static const char *const TAG = "i2c.idf";
 // Maximum bytes to log in hex format (truncates larger transfers)
 static constexpr size_t I2C_MAX_LOG_BYTES = 32;
 
-void IDFI2CBus::setup() {
+bool IDFI2CBus::init_bus_(bool do_scan) {
   static i2c_port_t next_hp_port = I2C_NUM_0;
 #if SOC_LP_I2C_SUPPORTED
   static i2c_port_t next_lp_port = LP_I2C_NUM_0;
 #endif
-
-  if (this->timeout_ > 13000) {
-    ESP_LOGW(TAG, "Using max allowed timeout: 13 ms");
-    this->timeout_ = 13000;
-  }
 
   this->recover_();
 
@@ -37,23 +32,27 @@ void IDFI2CBus::setup() {
   bus_conf.glitch_ignore_cnt = 7;
 #if SOC_LP_I2C_SUPPORTED
   if (this->lp_mode_) {
-    if ((next_lp_port - LP_I2C_NUM_0) == SOC_LP_I2C_NUM) {
-      ESP_LOGE(TAG, "No more than %u LP buses supported", SOC_LP_I2C_NUM);
-      this->mark_failed();
-      return;
+    if (!this->port_assigned_) {
+      if ((next_lp_port - LP_I2C_NUM_0) == SOC_LP_I2C_NUM) {
+        ESP_LOGE(TAG, "No more than %u LP buses supported", SOC_LP_I2C_NUM);
+        return false;
+      }
+      this->port_ = next_lp_port;
+      next_lp_port = (i2c_port_t) (next_lp_port + 1);
+      this->port_assigned_ = true;
     }
-    this->port_ = next_lp_port;
-    next_lp_port = (i2c_port_t) (next_lp_port + 1);
     bus_conf.lp_source_clk = LP_I2C_SCLK_DEFAULT;
   } else {
 #endif
-    if (next_hp_port == SOC_HP_I2C_NUM) {
-      ESP_LOGE(TAG, "No more than %u HP buses supported", SOC_HP_I2C_NUM);
-      this->mark_failed();
-      return;
+    if (!this->port_assigned_) {
+      if (next_hp_port == SOC_HP_I2C_NUM) {
+        ESP_LOGE(TAG, "No more than %u HP buses supported", SOC_HP_I2C_NUM);
+        return false;
+      }
+      this->port_ = next_hp_port;
+      next_hp_port = (i2c_port_t) (next_hp_port + 1);
+      this->port_assigned_ = true;
     }
-    this->port_ = next_hp_port;
-    next_hp_port = (i2c_port_t) (next_hp_port + 1);
     bus_conf.clk_source = I2C_CLK_SRC_DEFAULT;
 #if SOC_LP_I2C_SUPPORTED
   }
@@ -63,8 +62,7 @@ void IDFI2CBus::setup() {
   esp_err_t err = i2c_new_master_bus(&bus_conf, &this->bus_);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
+    return false;
   }
 
   i2c_device_config_t dev_conf{};
@@ -76,15 +74,78 @@ void IDFI2CBus::setup() {
   err = i2c_master_bus_add_device(this->bus_, &dev_conf, &this->dev_);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "i2c_master_bus_add_device failed: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
+    i2c_del_master_bus(this->bus_);
+    this->bus_ = nullptr;
+    return false;
   }
 
   this->initialized_ = true;
 
-  if (this->scan_) {
+  if (do_scan && this->scan_) {
     ESP_LOGV(TAG, "Scanning for devices");
     this->i2c_scan_();
+  }
+
+  return true;
+}
+
+bool IDFI2CBus::recover_bus_(const char *reason) {
+  if (this->recovery_in_progress_)
+    return false;
+
+  this->recovery_in_progress_ = true;
+  ESP_LOGW(TAG, "I2C bus recovery triggered (%s)", reason);
+
+  if (this->bus_ != nullptr) {
+    auto reset_err = i2c_master_bus_reset(this->bus_);
+    if (reset_err != ESP_OK) {
+      ESP_LOGW(TAG, "i2c_master_bus_reset failed: %s", esp_err_to_name(reset_err));
+    }
+  }
+
+  this->recover_();
+
+  if (this->bus_ != nullptr) {
+    auto reset_err = i2c_master_bus_reset(this->bus_);
+    if (reset_err != ESP_OK) {
+      ESP_LOGW(TAG, "i2c_master_bus_reset failed after recovery: %s", esp_err_to_name(reset_err));
+    }
+  }
+
+  const bool ok = this->bus_lines_high_();
+  if (!ok) {
+    ESP_LOGE(TAG, "I2C bus recovery failed");
+  }
+  this->recovery_in_progress_ = false;
+  return ok;
+}
+
+bool IDFI2CBus::bus_lines_high_() const {
+  const auto scl = static_cast<gpio_num_t>(this->scl_pin_);
+  const auto sda = static_cast<gpio_num_t>(this->sda_pin_);
+  return gpio_get_level(scl) == 1 && gpio_get_level(sda) == 1;
+}
+
+bool IDFI2CBus::preflight_check_() {
+  if (this->recovery_in_progress_)
+    return true;
+
+  if (this->bus_lines_high_())
+    return true;
+
+  ESP_LOGW(TAG, "I2C bus lines held low before transfer");
+  return this->recover_bus_("line held low");
+}
+
+void IDFI2CBus::setup() {
+  if (this->timeout_ > 13000) {
+    ESP_LOGW(TAG, "Using max allowed timeout: 13 ms");
+    this->timeout_ = 13000;
+  }
+
+  if (!this->init_bus_(true)) {
+    this->mark_failed();
+    return;
   }
 }
 
@@ -132,6 +193,9 @@ ErrorCode IDFI2CBus::write_readv(uint8_t address, const uint8_t *write_buffer, s
   if (!initialized_) {
     ESP_LOGW(TAG, "i2c bus not initialized!");
     return ERROR_NOT_INITIALIZED;
+  }
+  if (!this->preflight_check_()) {
+    return ERROR_TIMEOUT;
   }
 
   i2c_operation_job_t jobs[8]{};
@@ -190,9 +254,11 @@ ErrorCode IDFI2CBus::write_readv(uint8_t address, const uint8_t *write_buffer, s
     return ERROR_NOT_ACKNOWLEDGED;
   } else if (err == ESP_ERR_TIMEOUT) {
     ESP_LOGV(TAG, "TX to %02X failed: timeout", address);
+    this->recover_bus_("transaction timeout");
     return ERROR_TIMEOUT;
   } else if (err != ESP_OK) {
     ESP_LOGV(TAG, "TX to %02X failed: %s", address, esp_err_to_name(err));
+    this->recover_bus_("transaction error");
     return ERROR_UNKNOWN;
   }
   return ERROR_OK;

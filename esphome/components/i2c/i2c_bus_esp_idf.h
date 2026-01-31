@@ -36,6 +36,10 @@ class IDFI2CBus final : public InternalI2CBus, public Component {
   int get_port() const override { return this->port_; }
 
  private:
+  bool init_bus_(bool do_scan);
+  bool recover_bus_(const char *reason);
+  bool preflight_check_();
+  bool bus_lines_high_() const;
   void recover_();
   RecoveryCode recovery_result_{};
 
@@ -43,6 +47,8 @@ class IDFI2CBus final : public InternalI2CBus, public Component {
   i2c_master_dev_handle_t dev_{};
   i2c_master_bus_handle_t bus_{};
   i2c_port_t port_{};
+  bool port_assigned_{false};
+  bool recovery_in_progress_{false};
   uint8_t sda_pin_{};
   bool sda_pullup_enabled_{};
   uint8_t scl_pin_{};
