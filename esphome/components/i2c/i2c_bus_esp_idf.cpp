@@ -96,23 +96,16 @@ bool IDFI2CBus::recover_bus_(const char *reason) {
   this->recovery_in_progress_ = true;
   ESP_LOGW(TAG, "I2C bus recovery triggered (%s)", reason);
 
+  bool ok = false;
   if (this->bus_ != nullptr) {
     auto reset_err = i2c_master_bus_reset(this->bus_);
     if (reset_err != ESP_OK) {
       ESP_LOGW(TAG, "i2c_master_bus_reset failed: %s", esp_err_to_name(reset_err));
+    } else {
+      ok = this->bus_lines_high_();
     }
   }
 
-  this->recover_();
-
-  if (this->bus_ != nullptr) {
-    auto reset_err = i2c_master_bus_reset(this->bus_);
-    if (reset_err != ESP_OK) {
-      ESP_LOGW(TAG, "i2c_master_bus_reset failed after recovery: %s", esp_err_to_name(reset_err));
-    }
-  }
-
-  const bool ok = this->bus_lines_high_();
   if (!ok) {
     ESP_LOGE(TAG, "I2C bus recovery failed");
   }
@@ -248,8 +241,26 @@ ErrorCode IDFI2CBus::write_readv(uint8_t address, const uint8_t *write_buffer, s
   }
   jobs[num_jobs++].command = I2C_MASTER_CMD_STOP;
   ESP_LOGV(TAG, "Sending %zu jobs", num_jobs);
+  // Depending on the ESP-IDF version, the i2c_master driver uses ESP_ERR_INVALID_STATE or
+  // ESP_ERR_INVALID_RESPONSE for multiple transaction failures (NACK, timeout). Measure runtime to distinguish
+  // "immediate NACK" from "blocked until timeout" so we trigger bus recovery only when useful.
+  const uint32_t start_ms = millis();
   esp_err_t err = i2c_master_execute_defined_operations(this->dev_, jobs, num_jobs, 100);
+  const uint32_t duration_ms = millis() - start_ms;
   if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_RESPONSE) {
+    // During bus scan/probes, a NACK is expected - do not attempt recovery.
+    if (read_count == 0 && write_count == 0) {
+      ESP_LOGV(TAG, "TX to %02X failed: not acked", address);
+      return ERROR_NOT_ACKNOWLEDGED;
+    }
+
+    // Heuristic: immediate failures are almost always NACK; long waits indicate a stuck/busy bus.
+    if (duration_ms >= 80 || !this->bus_lines_high_()) {
+      ESP_LOGV(TAG, "TX to %02X failed: stuck/busy bus (took %" PRIu32 " ms)", address, duration_ms);
+      this->recover_bus_("stuck/busy bus");
+      return ERROR_TIMEOUT;
+    }
+
     ESP_LOGV(TAG, "TX to %02X failed: not acked", address);
     return ERROR_NOT_ACKNOWLEDGED;
   } else if (err == ESP_ERR_TIMEOUT) {

@@ -37,6 +37,10 @@ class PCF8574Component final : public Component,
 
   bool read_gpio_();
   bool write_gpio_();
+  void maybe_resync_outputs_();
+  void note_io_failure_();
+  void note_io_success_();
+  bool in_io_cooldown_() const;
 
   /// Mask for the pin mode - 1 means output, 0 means input
   uint16_t mode_mask_{0x00};
@@ -44,8 +48,15 @@ class PCF8574Component final : public Component,
   uint16_t output_mask_{0x00};
   /// The state read in read_gpio_ - 1 means HIGH, 0 means LOW
   uint16_t input_mask_{0x00};
-  bool pcf8575_;  ///< TRUE->16-channel PCF8575, FALSE->8-channel PCF8574
+  bool pcf8575_{false};  ///< TRUE->16-channel PCF8575, FALSE->8-channel PCF8574
   InternalGPIOPin *interrupt_pin_{nullptr};
+
+  /// If I2C errors occur (EMI, bus hang, device reset), keep pin states stable and avoid per-pin retry storms.
+  uint32_t last_io_failure_ms_{0};
+  uint32_t io_retry_backoff_ms_{0};
+  bool output_resync_pending_{false};
+  uint32_t last_output_resync_attempt_ms_{0};
+  bool polling_required_{false};
 };
 
 /// Helper class to expose a PCF8574 pin as an internal input GPIO pin.

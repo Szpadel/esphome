@@ -1,9 +1,17 @@
 #include "pcf8574.h"
 #include "esphome/core/log.h"
 
+#include <algorithm>
+
 namespace esphome::pcf8574 {
 
 static const char *const TAG = "pcf8574";
+
+// After an I2C failure, throttle further I/O attempts to avoid 100ms-per-operation
+// stalls building up and triggering the loopTask watchdog.
+static constexpr uint32_t IO_RETRY_BASE_DELAY_MS = 100;
+static constexpr uint32_t IO_RETRY_MAX_DELAY_MS = 5000;
+static constexpr uint32_t OUTPUT_RESYNC_MIN_INTERVAL_MS = 250;
 
 void PCF8574Component::setup() {
   if (!this->read_gpio_()) {
@@ -30,10 +38,15 @@ void IRAM_ATTR PCF8574Component::gpio_intr(PCF8574Component *arg) { arg->enable_
 void PCF8574Component::loop() {
   // Invalidate the cache so the next digital_read() triggers a fresh I2C read
   this->reset_pin_cache_();
+  // If the device reset during an I2C glitch, re-apply all outputs even if no one toggles them.
+  this->maybe_resync_outputs_();
+  if (this->output_resync_pending_)
+    return;
   // Only disable the loop once INT has actually gone HIGH. Input transitions that straddle the
   // I2C read leave INT asserted without re-firing a falling edge, which would strand us with
   // stale state forever; keep looping until the line is released so we self-heal.
-  if (this->interrupt_pin_ != nullptr && this->interrupt_pin_->digital_read()) {
+  if ((this->interrupt_pin_ != nullptr && this->interrupt_pin_->digital_read()) ||
+      (this->interrupt_pin_ == nullptr && !this->polling_required_)) {
     this->disable_loop();
   }
 }
@@ -49,8 +62,20 @@ void PCF8574Component::dump_config() {
   }
 }
 bool PCF8574Component::digital_read_hw(uint8_t pin) {
-  // Read all pins from hardware into input_mask_
-  return this->read_gpio_();  // Return true if I2C read succeeded, false on error
+  // Read all pins from hardware into input_mask_. On failure, keep the last known state
+  // (user-selected behavior) and return "success" to the cache layer to avoid per-pin retry storms.
+  if (this->in_io_cooldown_()) {
+    return true;
+  }
+  if (!this->read_gpio_()) {
+    // Keep last-known input_mask_ and schedule a retry later.
+    this->note_io_failure_();
+    return true;
+  }
+
+  this->note_io_success_();
+  this->maybe_resync_outputs_();
+  return true;
 }
 
 bool PCF8574Component::digital_read_cache(uint8_t pin) { return this->input_mask_ & (1 << pin); }
@@ -61,18 +86,33 @@ void PCF8574Component::digital_write_hw(uint8_t pin, bool value) {
   } else {
     this->output_mask_ &= ~(1 << pin);
   }
-  this->write_gpio_();
+  if (this->in_io_cooldown_()) {
+    // Defer writes while we're backing off; do not extend backoff further for each queued write.
+    this->output_resync_pending_ = true;
+    return;
+  }
+  if (!this->write_gpio_()) {
+    // If a write fails (bus error/device reset), make sure we try to re-apply the full output state later.
+    this->note_io_failure_();
+  }
 }
 void PCF8574Component::pin_mode(uint8_t pin, gpio::Flags flags) {
   if (flags == gpio::FLAG_INPUT) {
     // Clear mode mask bit
     this->mode_mask_ &= ~(1 << pin);
-    // Write GPIO to enable input mode
-    this->write_gpio_();
     // Enable polling loop for input pins (not needed for interrupt-driven mode
     // where the ISR handles re-enabling loop)
     if (this->interrupt_pin_ == nullptr) {
+      this->polling_required_ = true;
       this->enable_loop();
+    }
+    // Write GPIO to enable input mode
+    if (this->in_io_cooldown_()) {
+      this->output_resync_pending_ = true;
+      return;
+    }
+    if (!this->write_gpio_()) {
+      this->note_io_failure_();
     }
   } else if (flags == gpio::FLAG_OUTPUT) {
     // Set mode mask bit
@@ -82,14 +122,23 @@ void PCF8574Component::pin_mode(uint8_t pin, gpio::Flags flags) {
 bool PCF8574Component::read_gpio_() {
   if (this->is_failed())
     return false;
-  bool success;
-  uint8_t data[2];
+
+  // Don't attempt another blocking transaction while we're in backoff.
+  if (this->in_io_cooldown_())
+    return false;
+
+  bool success{false};
+  uint8_t data[2]{0, 0};
   if (this->pcf8575_) {
     success = this->read_bytes_raw(data, 2);
-    this->input_mask_ = (uint16_t(data[1]) << 8) | (uint16_t(data[0]) << 0);
+    if (success) {
+      this->input_mask_ = (uint16_t(data[1]) << 8) | (uint16_t(data[0]) << 0);
+    }
   } else {
     success = this->read_bytes_raw(data, 1);
-    this->input_mask_ = data[0];
+    if (success) {
+      this->input_mask_ = data[0];
+    }
   }
 
   if (!success) {
@@ -102,6 +151,12 @@ bool PCF8574Component::read_gpio_() {
 bool PCF8574Component::write_gpio_() {
   if (this->is_failed())
     return false;
+
+  // Avoid repeated 100ms stalls when the I2C bus is unhealthy.
+  if (this->in_io_cooldown_()) {
+    this->output_resync_pending_ = true;
+    return false;
+  }
 
   uint16_t value = 0;
   // Pins in OUTPUT mode and where pin is HIGH.
@@ -118,6 +173,8 @@ bool PCF8574Component::write_gpio_() {
   }
 
   this->status_clear_warning();
+  this->output_resync_pending_ = false;
+  this->note_io_success_();
   return true;
 }
 float PCF8574Component::get_setup_priority() const { return setup_priority::IO; }
@@ -128,6 +185,48 @@ bool PCF8574GPIOPin::digital_read() { return this->parent_->digital_read(this->p
 void PCF8574GPIOPin::digital_write(bool value) { this->parent_->digital_write(this->pin_, value != this->inverted_); }
 size_t PCF8574GPIOPin::dump_summary(char *buffer, size_t len) const {
   return buf_append_printf(buffer, len, 0, "%u via PCF8574", this->pin_);
+}
+
+bool PCF8574Component::in_io_cooldown_() const {
+  if (this->io_retry_backoff_ms_ == 0)
+    return false;
+  return (millis() - this->last_io_failure_ms_) < this->io_retry_backoff_ms_;
+}
+
+void PCF8574Component::note_io_failure_() {
+  const uint32_t now = millis();
+  this->last_io_failure_ms_ = now;
+  if (this->io_retry_backoff_ms_ == 0) {
+    this->io_retry_backoff_ms_ = IO_RETRY_BASE_DELAY_MS;
+  } else if (this->io_retry_backoff_ms_ < IO_RETRY_MAX_DELAY_MS) {
+    this->io_retry_backoff_ms_ = std::min(this->io_retry_backoff_ms_ * 2, IO_RETRY_MAX_DELAY_MS);
+  }
+
+  // Reading failures may mean the device reset - re-apply outputs once comms are back.
+  this->output_resync_pending_ = true;
+  this->enable_loop();
+}
+
+void PCF8574Component::note_io_success_() {
+  this->io_retry_backoff_ms_ = 0;
+  this->last_io_failure_ms_ = 0;
+}
+
+void PCF8574Component::maybe_resync_outputs_() {
+  if (!this->output_resync_pending_)
+    return;
+
+  if (this->in_io_cooldown_())
+    return;
+
+  const uint32_t now = millis();
+  if ((now - this->last_output_resync_attempt_ms_) < OUTPUT_RESYNC_MIN_INTERVAL_MS)
+    return;
+  this->last_output_resync_attempt_ms_ = now;
+
+  if (!this->write_gpio_()) {
+    this->note_io_failure_();
+  }
 }
 
 }  // namespace esphome::pcf8574
